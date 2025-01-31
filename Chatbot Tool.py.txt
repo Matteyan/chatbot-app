@@ -1,0 +1,218 @@
+import streamlit as st
+from PyPDF2 import PdfReader
+from langchain.schema import Document
+from langchain.vectorstores import FAISS
+from langchain.embeddings import HuggingFaceEmbeddings
+from langchain.chains import ConversationalRetrievalChain
+from langchain.memory import ConversationBufferMemory
+from langchain.llms import OpenAI
+import os
+import re
+import ezdxf
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+
+# Custom CSS for the robot icon and chat window
+st.markdown("""
+<style>
+    /* Robot icon */
+    .robot-icon {
+        position: fixed;
+        bottom: 20px;
+        right: 20px;
+        cursor: pointer;
+        z-index: 1000;
+    }
+    /* Chat window */
+    .chat-window {
+        position: fixed;
+        bottom: 80px;
+        right: 20px;
+        width: 300px;
+        height: 400px;
+        background: white;
+        border: 1px solid #ccc;
+        border-radius: 10px;
+        box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+        padding: 10px;
+        display: none;
+        z-index: 999;
+    }
+    /* Show chat window when toggled */
+    .show-chat {
+        display: block;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# Robot icon and chat window HTML
+st.markdown("""
+<div class="robot-icon" onclick="toggleChat()">
+    <img src="https://nam11.safelinks.protection.outlook.com/?url=https%3A%2F%2Fcdn-icons-png.flaticon.com%2F512%2F4712%2F4712035.png&data=05%7C02%7C%7C8e9c981e1d23461c632f08dd41cd2a1b%7Cdf830743ee40481aa7582f9ce8701359%7C0%7C0%7C638739071646857010%7CUnknown%7CTWFpbGZsb3d8eyJFbXB0eU1hcGkiOnRydWUsIlYiOiIwLjAuMDAwMCIsIlAiOiJXaW4zMiIsIkFOIjoiTWFpbCIsIldUIjoyfQ%3D%3D%7C0%7C%7C%7C&sdata=gwgmM7LvyihSnmabLmFFpqp72LqnBtM91p62uIybz6k%3D&reserved=0" width="50" height="50">
+</div>
+<div id="chatWindow" class="chat-window">
+    <div id="chatHistory" style="height: 300px; overflow-y: auto;"></div>
+    <input type="text" id="userInput" placeholder="Ask a question..." style="width: 100%; margin-top: 10px;">
+    <button onclick="sendMessage()" style="width: 100%; margin-top: 10px;">Send</button>
+</div>
+<script>
+    function toggleChat() {
+        var chatWindow = document.getElementById("chatWindow");
+        chatWindow.classList.toggle("show-chat");
+    }
+    function sendMessage() {
+        var userInput = document.getElementById("userInput").value;
+        if (userInput.trim() !== "") {
+            // Add user message to chat history
+            var chatHistory = document.getElementById("chatHistory");
+            chatHistory.innerHTML += `<div><strong>You:</strong> ${userInput}</div>`;
+            // Clear input
+            document.getElementById("userInput").value = "";
+            // Scroll to bottom
+            chatHistory.scrollTop = chatHistory.scrollHeight;
+            // Send message to backend (you can use Streamlit's st.session_state for this)
+            fetch("/send_message", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({ message: userInput }),
+            })
+            .then(response => response.json())
+            .then(data => {
+                // Add bot response to chat history
+                chatHistory.innerHTML += `<div><strong>Bot:</strong> ${data.response}</div>`;
+                // Scroll to bottom
+                chatHistory.scrollTop = chatHistory.scrollHeight;
+            });
+        }
+    }
+</script>
+""", unsafe_allow_html=True)
+
+# Backend logic for the chatbot
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# Folder path for PDFs and DWGs
+folder_path = "docs_folder"  # Replace with your folder path
+
+# Load PDFs and DWGs from the folder
+def load_documents(folder_path):
+    documents = []
+    for root, _, files in os.walk(folder_path):
+        for file in files:
+            file_path = os.path.join(root, file)
+            if file.endswith(".pdf"):
+                text = extract_text_from_pdf(file_path)
+                sentences = preprocess_text(text)
+                documents.extend(create_documents(sentences, file_path, "pdf"))
+            elif file.endswith(".dwg"):
+                text = extract_text_from_dwg(file_path)
+                if text:
+                    documents.extend(create_documents([text], file_path, "dwg"))
+    return documents
+
+# Extract text from a PDF
+def extract_text_from_pdf(pdf_path):
+    reader = PdfReader(pdf_path)
+    text = ""
+    for page in reader.pages:
+        text += page.extract_text()
+    return text
+
+# Extract text from a DWG
+def extract_text_from_dwg(dwg_path):
+    try:
+        doc = ezdxf.readfile(dwg_path)
+        msp = doc.modelspace()
+        text = ""
+        for entity in msp:
+            if entity.dxftype() == "TEXT":
+                text += entity.dxf.text + " "
+        return text.strip()
+    except Exception as e:
+        st.error(f"Error reading DWG file {dwg_path}: {e}")
+        return None
+
+# Preprocess the text
+def preprocess_text(text):
+    text = re.sub(r'\s+', ' ', text).strip()
+    sentences = re.split(r'(?<=[.!?]) +', text)
+    sentences = [s.strip() for s in sentences if s.strip()]
+    return sentences
+
+# Create LangChain Document objects
+def create_documents(sentences, source, file_type):
+    documents = [
+        Document(page_content=sentence, metadata={"source": source, "file_type": file_type, "page": i + 1})
+        for i, sentence in enumerate(sentences)
+    ]
+    return documents
+
+# Initialize the chatbot
+def setup_chatbot(documents, openai_api_key):
+    embedding_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    vector_store = FAISS.from_documents(documents, embedding_model)
+    llm = OpenAI(api_key=openai_api_key, temperature=0)
+    memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+    qa_chain = ConversationalRetrievalChain.from_llm(
+        llm=llm,
+        retriever=vector_store.as_retriever(),
+        memory=memory
+    )
+    return qa_chain
+
+# Handle messages sent from the frontend
+if st.session_state.get("user_input"):
+    user_input = st.session_state.user_input
+    st.session_state.messages.append({"role": "user", "content": user_input})
+    if "qa_chain" in st.session_state:
+        response = st.session_state.qa_chain({"question": user_input})["answer"]
+    else:
+        response = "Please enter your OpenAI API key in the sidebar."
+    st.session_state.messages.append({"role": "assistant", "content": response})
+    st.session_state.user_input = None  # Clear the input
+
+# Sidebar for settings
+with st.sidebar:
+    st.header("Settings")
+    openai_api_key = st.text_input("Enter your OpenAI API key:", type="password")
+    if openai_api_key:
+        documents = load_documents(folder_path)
+        st.session_state.qa_chain = setup_chatbot(documents, openai_api_key)
+
+# Folder monitoring for new files
+class FolderMonitor(FileSystemEventHandler):
+    def __init__(self, folder_path, callback):
+        self.folder_path = folder_path
+        self.callback = callback
+
+    def on_created(self, event):
+        if not event.is_directory:
+            self.callback(event.src_path)
+
+def on_new_file(file_path):
+    if file_path.endswith(".pdf"):
+        text = extract_text_from_pdf(file_path)
+        sentences = preprocess_text(text)
+        documents = create_documents(sentences, file_path, "pdf")
+    elif file_path.endswith(".dwg"):
+        text = extract_text_from_dwg(file_path)
+        if text:
+            documents = create_documents([text], file_path, "dwg")
+    if "qa_chain" in st.session_state:
+        st.session_state.qa_chain.retriever.add_documents(documents)
+
+# Start folder monitoring
+if "observer" not in st.session_state:
+    event_handler = FolderMonitor(folder_path, on_new_file)
+    observer = Observer()
+    observer.schedule(event_handler, folder_path, recursive=True)
+    observer.start()
+    st.session_state.observer = observer
+
+# Display chat history in the Streamlit app (for debugging)
+st.write("Chat History (Debug):")
+for message in st.session_state.messages:
+    st.write(f"{message['role']}: {message['content']}")
